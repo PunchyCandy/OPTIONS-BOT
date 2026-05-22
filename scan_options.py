@@ -1,60 +1,52 @@
-import os
-from datetime import date, timedelta
-from dotenv import load_dotenv
-from tabulate import tabulate
+import argparse
+from datetime import date, datetime, timedelta
+from uuid import uuid4
+from zoneinfo import ZoneInfo
+
 import yfinance as yf
+from alpaca.data.requests import OptionLatestQuoteRequest, StockLatestQuoteRequest
+from alpaca.trading.enums import AssetStatus, ContractType, OrderSide, QueryOrderStatus, TimeInForce
+from alpaca.trading.requests import GetOptionContractsRequest, GetOrdersRequest, LimitOrderRequest
+from tabulate import tabulate
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import GetOptionContractsRequest
-from alpaca.trading.enums import AssetStatus, ContractType
-
-from alpaca.data.historical import StockHistoricalDataClient, OptionHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest, OptionLatestQuoteRequest
-
-from alpaca.trading.requests import LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-
-from alpaca.trading.enums import QueryOrderStatus
-from alpaca.trading.requests import GetOrdersRequest
-
-
-def has_open_order_for_symbol(symbol):
-    request = GetOrdersRequest(
-        status=QueryOrderStatus.OPEN,
-        limit=50
-    )
-
-    orders = trading_client.get_orders(filter=request)
-
-    for order in orders:
-        if order.symbol == symbol:
-            return True
-
-    return False
-
-load_dotenv()
-
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
-if not API_KEY or not API_SECRET:
-    raise ValueError("Missing Alpaca API key or secret in .env")
-
-
-trading_client = TradingClient(
-    api_key=API_KEY,
-    secret_key=API_SECRET,
-    paper=True
+from alpaca_clients import (
+    BOT_ORDER_PREFIX,
+    get_bot_config,
+    get_option_data_client,
+    get_stock_data_client,
+    get_trading_client,
 )
 
-stock_data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
-option_data_client = OptionHistoricalDataClient(API_KEY, API_SECRET)
+
+def has_open_order_for_symbol(trading_client, symbol):
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=50)
+    orders = trading_client.get_orders(filter=request)
+    return any(order.symbol == symbol for order in orders)
 
 
-def get_stock_mid_price(symbol="SPY"):
+def count_open_bot_orders(trading_client):
+    request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=50)
+    orders = trading_client.get_orders(filter=request)
+
+    return sum(
+        1
+        for order in orders
+        if str(getattr(order, "client_order_id", "")).startswith(BOT_ORDER_PREFIX)
+    )
+
+
+def get_position_qty(trading_client, symbol):
+    try:
+        position = trading_client.get_open_position(symbol)
+    except Exception:
+        return 0
+
+    return abs(int(float(position.qty)))
+
+
+def get_stock_mid_price(stock_data_client, symbol="SPY"):
     request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quotes = stock_data_client.get_stock_latest_quote(request)
-
     quote = quotes[symbol]
 
     bid = float(quote.bid_price)
@@ -66,7 +58,7 @@ def get_stock_mid_price(symbol="SPY"):
     return round((bid + ask) / 2, 2)
 
 
-def get_contracts(symbol="SPY", contract_type=ContractType.CALL):
+def get_contracts(trading_client, symbol="SPY", contract_type=ContractType.CALL):
     today = date.today()
     min_exp = today + timedelta(days=30)
     max_exp = today + timedelta(days=45)
@@ -77,25 +69,19 @@ def get_contracts(symbol="SPY", contract_type=ContractType.CALL):
         type=contract_type,
         expiration_date_gte=min_exp,
         expiration_date_lte=max_exp,
-        limit=1000
+        limit=1000,
     )
 
     response = trading_client.get_option_contracts(request)
-    contracts = getattr(response, "option_contracts", response)
-
-    return contracts
+    return getattr(response, "option_contracts", response)
 
 
 def filter_near_money_contracts(contracts, underlying_price, width=20):
-    filtered = []
-
-    for contract in contracts:
-        strike = float(contract.strike_price)
-
-        if abs(strike - underlying_price) <= width:
-            filtered.append(contract)
-
-    return filtered
+    return [
+        contract
+        for contract in contracts
+        if abs(float(contract.strike_price) - underlying_price) <= width
+    ]
 
 
 def chunk_list(items, chunk_size=100):
@@ -103,7 +89,7 @@ def chunk_list(items, chunk_size=100):
         yield items[i:i + chunk_size]
 
 
-def attach_option_quotes(contracts):
+def attach_option_quotes(option_data_client, contracts):
     symbols = [c.symbol for c in contracts]
 
     if not symbols:
@@ -111,7 +97,6 @@ def attach_option_quotes(contracts):
 
     all_quotes = {}
 
-    # Alpaca option latest quote endpoint allows max 100 symbols per request
     for symbol_chunk in chunk_list(symbols, 100):
         request = OptionLatestQuoteRequest(symbol_or_symbols=symbol_chunk)
         quotes = option_data_client.get_option_latest_quote(request)
@@ -119,8 +104,8 @@ def attach_option_quotes(contracts):
 
     rows = []
 
-    for c in contracts:
-        quote = all_quotes.get(c.symbol)
+    for contract in contracts:
+        quote = all_quotes.get(contract.symbol)
 
         if quote is None:
             continue
@@ -135,144 +120,85 @@ def attach_option_quotes(contracts):
         spread = round(ask - bid, 2)
         spread_pct = round((spread / mid) * 100, 2) if mid > 0 else None
 
-        rows.append({
-            "symbol": c.symbol,
-            "type": str(c.type).replace("ContractType.", ""),
-            "strike": float(c.strike_price),
-            "expiration": c.expiration_date,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread_pct": spread_pct,
-            "tradable": c.tradable,
-        })
+        rows.append(
+            {
+                "symbol": contract.symbol,
+                "type": str(contract.type).replace("ContractType.", ""),
+                "strike": float(contract.strike_price),
+                "expiration": contract.expiration_date,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "spread_pct": spread_pct,
+                "tradable": contract.tradable,
+            }
+        )
 
     return rows
 
 
 def print_candidates(rows, max_rows=30):
     rows = sorted(rows, key=lambda x: (x["expiration"], x["strike"]))
+    table = [
+        [
+            row["symbol"],
+            row["type"],
+            row["strike"],
+            row["expiration"],
+            row["bid"],
+            row["ask"],
+            row["mid"],
+            f'{row["spread_pct"]}%',
+            row["tradable"],
+        ]
+        for row in rows[:max_rows]
+    ]
 
-    table = []
-
-    for r in rows[:max_rows]:
-        table.append([
-            r["symbol"],
-            r["type"],
-            r["strike"],
-            r["expiration"],
-            r["bid"],
-            r["ask"],
-            r["mid"],
-            f'{r["spread_pct"]}%',
-            r["tradable"],
-        ])
-
-    print(tabulate(
-        table,
-        headers=[
-            "Symbol",
-            "Type",
-            "Strike",
-            "Expiration",
-            "Bid",
-            "Ask",
-            "Mid",
-            "Spread %",
-            "Tradable"
-        ],
-        tablefmt="github"
-    ))
+    print(
+        tabulate(
+            table,
+            headers=[
+                "Symbol",
+                "Type",
+                "Strike",
+                "Expiration",
+                "Bid",
+                "Ask",
+                "Mid",
+                "Spread %",
+                "Tradable",
+            ],
+            tablefmt="github",
+        )
+    )
 
 
 def choose_best_contract(rows, underlying_price, max_spread_pct=10, max_mid_price=25):
-    """
-    Pick the best near-money contract based on:
-    - tradable
-    - tight spread
-    - affordable contract price
-    - strike closest to underlying price
-    """
-
     filtered = []
 
-    for r in rows:
-        if not r["tradable"]:
+    for row in rows:
+        if not row["tradable"]:
             continue
 
-        if r["spread_pct"] is None:
+        if row["spread_pct"] is None or row["spread_pct"] > max_spread_pct:
             continue
 
-        if r["spread_pct"] > max_spread_pct:
+        if row["mid"] > max_mid_price:
             continue
 
-        if r["mid"] > max_mid_price:
-            continue
-
-        filtered.append(r)
+        filtered.append(row)
 
     if not filtered:
         return None
 
-    # Closest strike to current SPY price
-    best = min(
+    return min(
         filtered,
-        key=lambda r: abs(r["strike"] - underlying_price)
+        key=lambda row: (
+            abs(row["strike"] - underlying_price),
+            row["spread_pct"],
+            row["mid"],
+        ),
     )
-
-    return best
-
-
-def chunk_list(items, chunk_size=100):
-    for i in range(0, len(items), chunk_size):
-        yield items[i:i + chunk_size]
-
-
-def attach_option_quotes(contracts):
-    symbols = [c.symbol for c in contracts]
-
-    if not symbols:
-        return []
-
-    all_quotes = {}
-
-    # Alpaca option latest quote endpoint allows max 100 symbols per request
-    for symbol_chunk in chunk_list(symbols, 100):
-        request = OptionLatestQuoteRequest(symbol_or_symbols=symbol_chunk)
-        quotes = option_data_client.get_option_latest_quote(request)
-        all_quotes.update(quotes)
-
-    rows = []
-
-    for c in contracts:
-        quote = all_quotes.get(c.symbol)
-
-        if quote is None:
-            continue
-
-        bid = float(quote.bid_price or 0)
-        ask = float(quote.ask_price or 0)
-
-        if bid <= 0 or ask <= 0:
-            continue
-
-        mid = round((bid + ask) / 2, 2)
-        spread = round(ask - bid, 2)
-        spread_pct = round((spread / mid) * 100, 2) if mid > 0 else None
-
-        rows.append({
-            "symbol": c.symbol,
-            "type": str(c.type).replace("ContractType.", ""),
-            "strike": float(c.strike_price),
-            "expiration": c.expiration_date,
-            "bid": bid,
-            "ask": ask,
-            "mid": mid,
-            "spread_pct": spread_pct,
-            "tradable": c.tradable,
-        })
-
-    return rows
 
 
 def get_trend_signal(symbol="SPY"):
@@ -281,55 +207,104 @@ def get_trend_signal(symbol="SPY"):
     if df.empty:
         raise ValueError(f"No price data returned for {symbol}")
 
-    # yfinance sometimes returns MultiIndex columns even for one ticker.
-    # This safely turns Close into a normal Series.
     close = df["Close"]
 
     if hasattr(close, "columns"):
         close = close.iloc[:, 0]
 
-    df["SMA_20"] = close.rolling(window=20).mean()
-    df["SMA_50"] = close.rolling(window=50).mean()
+    sma_20 = close.rolling(window=20).mean()
+    sma_50 = close.rolling(window=50).mean()
 
     latest_close = close.iloc[-1].item()
-    sma_20 = df["SMA_20"].iloc[-1].item()
-    sma_50 = df["SMA_50"].iloc[-1].item()
+    latest_sma_20 = sma_20.iloc[-1].item()
+    latest_sma_50 = sma_50.iloc[-1].item()
 
     print("\nTrend check:")
     print("Latest close:", round(latest_close, 2))
-    print("20 SMA:", round(sma_20, 2))
-    print("50 SMA:", round(sma_50, 2))
+    print("20 SMA:", round(latest_sma_20, 2))
+    print("50 SMA:", round(latest_sma_50, 2))
 
-    if latest_close > sma_20 and sma_20 > sma_50:
+    if latest_close > latest_sma_20 > latest_sma_50:
         return "BUY_CALL"
 
-    if latest_close < sma_20 and sma_20 < sma_50:
+    if latest_close < latest_sma_20 < latest_sma_50:
         return "BUY_PUT"
 
     return "NO_TRADE"
 
 
-def place_paper_option_order(selected_contract, signal, qty=1):
-    if not is_regular_market_hours():
-        print("Market is closed for regular options trading. No order placed.")
-        return None
-    
+def is_regular_market_hours(trading_client):
+    clock = trading_client.get_clock()
+
+    if not clock.is_open:
+        return False
+
+    now = datetime.now(ZoneInfo("America/New_York"))
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+
+    return market_open <= now <= market_close
+
+
+def validate_order_risk(trading_client, selected_contract, signal, qty, config):
     if selected_contract is None:
-        print("No selected contract. No order placed.")
-        return None
+        return False, "No selected contract."
 
     if signal not in ["BUY_CALL", "BUY_PUT"]:
-        print(f"Signal is {signal}. No order placed.")
+        return False, f"Signal is {signal}."
+
+    symbol = selected_contract["symbol"]
+
+    if not symbol.startswith(config.underlying):
+        return False, f"{symbol} is not allowed for underlying {config.underlying}."
+
+    if has_open_order_for_symbol(trading_client, symbol):
+        return False, f"Open order already exists for {symbol}."
+
+    if count_open_bot_orders(trading_client) >= config.max_open_orders:
+        return False, f"Bot already has {config.max_open_orders} open order(s)."
+
+    current_qty = get_position_qty(trading_client, symbol)
+
+    if current_qty + qty > config.max_position_qty:
+        return False, f"Position limit would be exceeded for {symbol}."
+
+    limit_price = round(float(selected_contract["mid"]), 2)
+    estimated_cost = limit_price * 100 * qty
+
+    if limit_price > config.max_mid_price:
+        return False, f"Mid price {limit_price} exceeds max {config.max_mid_price}."
+
+    if estimated_cost > config.max_contract_cost:
+        return False, f"Estimated cost {estimated_cost} exceeds max {config.max_contract_cost}."
+
+    account = trading_client.get_account()
+
+    if getattr(account, "trading_blocked", False):
+        return False, "Account trading is blocked."
+
+    buying_power = float(account.buying_power)
+
+    if estimated_cost > buying_power:
+        return False, f"Estimated cost {estimated_cost} exceeds buying power {buying_power}."
+
+    return True, "Risk checks passed."
+
+
+def place_paper_option_order(trading_client, selected_contract, signal, qty, config):
+    if not is_regular_market_hours(trading_client):
+        print("Market is closed for regular options trading. No order placed.")
+        return None
+
+    ok, reason = validate_order_risk(trading_client, selected_contract, signal, qty, config)
+
+    if not ok:
+        print(f"No order placed. {reason}")
         return None
 
     symbol = selected_contract["symbol"]
     limit_price = round(float(selected_contract["mid"]), 2)
-
     estimated_cost = limit_price * 100 * qty
-
-    if has_open_order_for_symbol(symbol):
-        print(f"Open order already exists for {symbol}. No new order placed.")
-        return None
 
     print("\nOrder preview:")
     print("Symbol:", symbol)
@@ -350,7 +325,8 @@ def place_paper_option_order(selected_contract, signal, qty=1):
         side=OrderSide.BUY,
         type="limit",
         time_in_force=TimeInForce.DAY,
-        limit_price=limit_price
+        limit_price=limit_price,
+        client_order_id=f"{BOT_ORDER_PREFIX}-{uuid4().hex[:20]}",
     )
 
     order = trading_client.submit_order(order_request)
@@ -364,63 +340,60 @@ def place_paper_option_order(selected_contract, signal, qty=1):
     return order
 
 
-from datetime import datetime
-from zoneinfo import ZoneInfo
+def parse_args():
+    parser = argparse.ArgumentParser(description="Scan near-money option contracts.")
+    parser.add_argument("--place-order", action="store_true", help="Submit a paper order after all checks pass.")
+    return parser.parse_args()
 
 
-def is_regular_market_hours():
-    now = datetime.now(ZoneInfo("America/New_York"))
+def main():
+    args = parse_args()
+    config = get_bot_config()
+    trading_client = get_trading_client()
+    stock_data_client = get_stock_data_client()
+    option_data_client = get_option_data_client()
+    underlying = config.underlying
 
-    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
-
-    is_weekday = now.weekday() < 5
-
-    return is_weekday and market_open <= now <= market_close
-
-if __name__ == "__main__":
-    underlying = "SPY"
-
-    spy_price = get_stock_mid_price(underlying)
-    print(f"{underlying} estimated mid price: {spy_price}")
+    underlying_price = get_stock_mid_price(stock_data_client, underlying)
+    print(f"{underlying} estimated mid price: {underlying_price}")
 
     print("\nFetching call contracts...")
-    calls = get_contracts(underlying, ContractType.CALL)
-    near_calls = filter_near_money_contracts(calls, spy_price, width=20)
-    call_rows = attach_option_quotes(near_calls)
+    calls = get_contracts(trading_client, underlying, ContractType.CALL)
+    near_calls = filter_near_money_contracts(calls, underlying_price, width=20)
+    call_rows = attach_option_quotes(option_data_client, near_calls)
 
     print(f"\nFound {len(call_rows)} near-money call candidates")
     print_candidates(call_rows)
 
     best_call = choose_best_contract(
         call_rows,
-        spy_price,
-        max_spread_pct=10,
-        max_mid_price=25
+        underlying_price,
+        max_spread_pct=config.max_spread_pct,
+        max_mid_price=config.max_mid_price,
     )
 
     print("\nBest call candidate:")
     print(best_call)
 
     print("\nFetching put contracts...")
-    puts = get_contracts(underlying, ContractType.PUT)
-    near_puts = filter_near_money_contracts(puts, spy_price, width=20)
-    put_rows = attach_option_quotes(near_puts)
+    puts = get_contracts(trading_client, underlying, ContractType.PUT)
+    near_puts = filter_near_money_contracts(puts, underlying_price, width=20)
+    put_rows = attach_option_quotes(option_data_client, near_puts)
 
     print(f"\nFound {len(put_rows)} near-money put candidates")
     print_candidates(put_rows)
 
     best_put = choose_best_contract(
         put_rows,
-        spy_price,
-        max_spread_pct=10,
-        max_mid_price=25
+        underlying_price,
+        max_spread_pct=config.max_spread_pct,
+        max_mid_price=config.max_mid_price,
     )
 
     print("\nBest put candidate:")
     print(best_put)
 
-    signal = get_trend_signal("SPY")
+    signal = get_trend_signal(underlying)
 
     print("\nBot signal:", signal)
 
@@ -434,8 +407,18 @@ if __name__ == "__main__":
     print("\nSelected contract:")
     print(selected_contract)
 
+    if not args.place_order:
+        print("\nDry run only. Re-run with --place-order to submit a paper order.")
+        return
+
     place_paper_option_order(
+        trading_client=trading_client,
         selected_contract=selected_contract,
         signal=signal,
-        qty=1
+        qty=config.order_qty,
+        config=config,
     )
+
+
+if __name__ == "__main__":
+    main()

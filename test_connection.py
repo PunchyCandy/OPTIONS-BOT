@@ -1,20 +1,7 @@
-import os
-from dotenv import load_dotenv
-from alpaca.trading.client import TradingClient
+from alpaca_clients import get_trading_client
 
-load_dotenv()
 
-API_KEY = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
-
-if not API_KEY or not API_SECRET:
-    raise ValueError("Missing Alpaca API key or secret in .env")
-
-client = TradingClient(
-    api_key=API_KEY,
-    secret_key=API_SECRET,
-    paper=True
-)
+client = get_trading_client()
 
 account = client.get_account()
 
