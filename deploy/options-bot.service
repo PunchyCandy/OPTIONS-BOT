@@ -1,0 +1,20 @@
+[Unit]
+Description=Options Bot paper trading loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=optionsbot
+Group=optionsbot
+WorkingDirectory=/opt/options-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/options-bot/venv/bin/python /opt/options-bot/scan_options.py --loop --market-open-only --place-order --yes
+Restart=always
+RestartSec=30
+
+# Keep credentials readable only by the service user.
+EnvironmentFile=/opt/options-bot/.env
+
+[Install]
+WantedBy=multi-user.target

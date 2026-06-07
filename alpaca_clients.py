@@ -21,6 +21,7 @@ class BotConfig:
     max_open_orders: int
     max_position_qty: int
     order_qty: int
+    scan_interval_minutes: int
 
 
 def _required_env(name):
@@ -73,4 +74,5 @@ def get_bot_config():
         max_open_orders=_env_int("BOT_MAX_OPEN_ORDERS", 1),
         max_position_qty=_env_int("BOT_MAX_POSITION_QTY", 1),
         order_qty=_env_int("BOT_ORDER_QTY", 1),
+        scan_interval_minutes=_env_int("BOT_SCAN_INTERVAL_MINUTES", 15),
     )

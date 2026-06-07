@@ -1,4 +1,5 @@
 import argparse
+import time
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -246,6 +247,20 @@ def is_regular_market_hours(trading_client):
     return market_open <= now <= market_close
 
 
+def market_status_message(trading_client):
+    clock = trading_client.get_clock()
+
+    if clock.is_open:
+        return "Market is open."
+
+    next_open = getattr(clock, "next_open", None)
+
+    if next_open:
+        return f"Market is closed. Next open: {next_open}."
+
+    return "Market is closed."
+
+
 def validate_order_risk(trading_client, selected_contract, signal, qty, config):
     if selected_contract is None:
         return False, "No selected contract."
@@ -291,7 +306,14 @@ def validate_order_risk(trading_client, selected_contract, signal, qty, config):
     return True, "Risk checks passed."
 
 
-def place_paper_option_order(trading_client, selected_contract, signal, qty, config):
+def place_paper_option_order(
+    trading_client,
+    selected_contract,
+    signal,
+    qty,
+    config,
+    require_confirmation=True,
+):
     if not is_regular_market_hours(trading_client):
         print("Market is closed for regular options trading. No order placed.")
         return None
@@ -313,11 +335,14 @@ def place_paper_option_order(trading_client, selected_contract, signal, qty, con
     print("Limit price:", limit_price)
     print("Estimated cost:", estimated_cost)
 
-    confirm = input("\nPlace this PAPER order? Type YES to confirm: ")
+    if require_confirmation:
+        confirm = input("\nPlace this PAPER order? Type YES to confirm: ")
 
-    if confirm != "YES":
-        print("Order cancelled.")
-        return None
+        if confirm != "YES":
+            print("Order cancelled.")
+            return None
+    else:
+        print("\nAuto-confirm enabled. Submitting PAPER order.")
 
     order_request = LimitOrderRequest(
         symbol=symbol,
@@ -343,16 +368,34 @@ def place_paper_option_order(trading_client, selected_contract, signal, qty, con
 def parse_args():
     parser = argparse.ArgumentParser(description="Scan near-money option contracts.")
     parser.add_argument("--place-order", action="store_true", help="Submit a paper order after all checks pass.")
+    parser.add_argument("--yes", action="store_true", help="Skip interactive confirmation. Use only for paper automation.")
+    parser.add_argument("--loop", action="store_true", help="Run continuously for VM/systemd deployment.")
+    parser.add_argument(
+        "--interval-minutes",
+        type=int,
+        help="Minutes to sleep between loop iterations. Defaults to BOT_SCAN_INTERVAL_MINUTES.",
+    )
+    parser.add_argument(
+        "--market-open-only",
+        action="store_true",
+        help="In loop mode, skip scans unless Alpaca reports the market is open.",
+    )
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    config = get_bot_config()
-    trading_client = get_trading_client()
-    stock_data_client = get_stock_data_client()
-    option_data_client = get_option_data_client()
+def run_scan(
+    config,
+    trading_client,
+    stock_data_client,
+    option_data_client,
+    place_order=False,
+    require_confirmation=True,
+):
     underlying = config.underlying
+
+    print("\n" + "=" * 72)
+    print(datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds"))
+    print(market_status_message(trading_client))
 
     underlying_price = get_stock_mid_price(stock_data_client, underlying)
     print(f"{underlying} estimated mid price: {underlying_price}")
@@ -407,7 +450,7 @@ def main():
     print("\nSelected contract:")
     print(selected_contract)
 
-    if not args.place_order:
+    if not place_order:
         print("\nDry run only. Re-run with --place-order to submit a paper order.")
         return
 
@@ -417,6 +460,62 @@ def main():
         signal=signal,
         qty=config.order_qty,
         config=config,
+        require_confirmation=require_confirmation,
+    )
+
+
+def run_loop(args, config, trading_client, stock_data_client, option_data_client):
+    interval_minutes = args.interval_minutes or config.scan_interval_minutes
+    sleep_seconds = max(interval_minutes, 1) * 60
+
+    print(f"Starting options bot loop. Interval: {interval_minutes} minute(s).")
+    print("Press Ctrl+C to stop.")
+
+    while True:
+        try:
+            if args.market_open_only and not is_regular_market_hours(trading_client):
+                print("\n" + "=" * 72)
+                print(datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds"))
+                print(market_status_message(trading_client))
+                print("Skipping scan until regular market hours.")
+            else:
+                run_scan(
+                    config=config,
+                    trading_client=trading_client,
+                    stock_data_client=stock_data_client,
+                    option_data_client=option_data_client,
+                    place_order=args.place_order,
+                    require_confirmation=not args.yes,
+                )
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:
+            print(f"Scan failed: {exc}")
+
+        time.sleep(sleep_seconds)
+
+
+def main():
+    args = parse_args()
+    config = get_bot_config()
+    trading_client = get_trading_client()
+    stock_data_client = get_stock_data_client()
+    option_data_client = get_option_data_client()
+
+    if args.yes and not args.place_order:
+        raise ValueError("--yes only makes sense with --place-order")
+
+    if args.loop:
+        run_loop(args, config, trading_client, stock_data_client, option_data_client)
+        return
+
+    run_scan(
+        config=config,
+        trading_client=trading_client,
+        stock_data_client=stock_data_client,
+        option_data_client=option_data_client,
+        place_order=args.place_order,
+        require_confirmation=not args.yes,
     )
 
 

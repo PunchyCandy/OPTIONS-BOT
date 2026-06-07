@@ -1,9 +1,10 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from alpaca_clients import BOT_ORDER_PREFIX, BotConfig
 from cancel_orders import should_cancel_order
-from scan_options import choose_best_contract, validate_order_risk
+from scan_options import choose_best_contract, place_paper_option_order, validate_order_risk
 
 
 class FakeTradingClient:
@@ -14,6 +15,7 @@ class FakeTradingClient:
             buying_power=str(buying_power),
             trading_blocked=trading_blocked,
         )
+        self.submitted_order = None
 
     def get_orders(self, filter=None):
         return self.orders
@@ -27,6 +29,18 @@ class FakeTradingClient:
     def get_account(self):
         return self.account
 
+    def get_clock(self):
+        return SimpleNamespace(is_open=True)
+
+    def submit_order(self, order_request):
+        self.submitted_order = order_request
+        return SimpleNamespace(
+            id="order-1",
+            status="accepted",
+            symbol=order_request.symbol,
+            limit_price=order_request.limit_price,
+        )
+
 
 def make_config(**overrides):
     defaults = {
@@ -37,6 +51,7 @@ def make_config(**overrides):
         "max_open_orders": 1,
         "max_position_qty": 1,
         "order_qty": 1,
+        "scan_interval_minutes": 15,
     }
     defaults.update(overrides)
     return BotConfig(**defaults)
@@ -100,6 +115,27 @@ class ScanOptionsTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertEqual(reason, "Risk checks passed.")
+
+    def test_place_paper_option_order_can_skip_prompt_for_vm_mode(self):
+        client = FakeTradingClient()
+        selected_contract = {
+            "symbol": "SPY260619C00600000",
+            "mid": 2.5,
+        }
+
+        with patch("scan_options.is_regular_market_hours", return_value=True):
+            order = place_paper_option_order(
+                client,
+                selected_contract,
+                "BUY_CALL",
+                qty=1,
+                config=make_config(),
+                require_confirmation=False,
+            )
+
+        self.assertIsNotNone(order)
+        self.assertIsNotNone(client.submitted_order)
+        self.assertTrue(client.submitted_order.client_order_id.startswith(BOT_ORDER_PREFIX))
 
 
 if __name__ == "__main__":

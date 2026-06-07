@@ -27,6 +27,18 @@ Place a paper order only after the scanner passes its risk checks:
 python scan_options.py --place-order
 ```
 
+Run continuously, scanning only during regular market hours:
+
+```bash
+python scan_options.py --loop --market-open-only
+```
+
+Run continuously and allow paper order placement without a prompt:
+
+```bash
+python scan_options.py --loop --market-open-only --place-order --yes
+```
+
 Inspect account state:
 
 ```bash
@@ -50,3 +62,71 @@ python cancel_orders.py --symbol SPY260619C00600000
 ## Safety Notes
 
 The bot defaults to Alpaca paper trading and defaults to dry-run scanning. Keep `--place-order` explicit, and keep `.env` out of git.
+
+Important `.env` controls:
+
+```bash
+BOT_UNDERLYING=SPY
+BOT_MAX_CONTRACT_COST=2500
+BOT_MAX_MID_PRICE=25
+BOT_MAX_SPREAD_PCT=10
+BOT_MAX_OPEN_ORDERS=1
+BOT_MAX_POSITION_QTY=1
+BOT_ORDER_QTY=1
+BOT_SCAN_INTERVAL_MINUTES=15
+```
+
+## VM Deployment
+
+Use an Ubuntu VM or similar Linux host. The bot is designed to run under `systemd` as a dedicated `optionsbot` user from `/opt/options-bot`.
+
+On the VM:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv rsync
+git clone https://github.com/PunchyCandy/OPTIONS-BOT.git
+cd OPTIONS-BOT
+sudo ./deploy/install_vm.sh
+```
+
+Edit credentials and safety settings:
+
+```bash
+sudo nano /opt/options-bot/.env
+```
+
+Start the bot:
+
+```bash
+sudo systemctl start options-bot
+sudo systemctl status options-bot
+```
+
+Watch logs:
+
+```bash
+sudo journalctl -u options-bot -f
+```
+
+Stop it:
+
+```bash
+sudo systemctl stop options-bot
+```
+
+After pulling updates on the VM, reinstall and restart:
+
+```bash
+git pull
+sudo ./deploy/install_vm.sh
+sudo systemctl restart options-bot
+```
+
+The service command is:
+
+```bash
+/opt/options-bot/venv/bin/python /opt/options-bot/scan_options.py --loop --market-open-only --place-order --yes
+```
+
+That means the VM will stay running, skip scans while the market is closed, and submit paper orders during regular market hours only after all configured risk gates pass.
