@@ -63,6 +63,19 @@ python cancel_orders.py --symbol SPY260619C00600000
 
 The bot defaults to Alpaca paper trading and defaults to dry-run scanning. Keep `--place-order` explicit, and keep `.env` out of git.
 
+## Strategy
+
+The bot uses a strict calls-only intraday reversal setup for SPY/QQQ-style liquid options:
+
+1. Price touched or closed below the lower 20-period Bollinger Band recently.
+2. RSI 14 was below 35 recently.
+3. Price closes back above the lower Bollinger Band.
+4. RSI crosses back above 35.
+5. Price reclaims session VWAP.
+6. Current volume is above 20-bar average volume.
+
+If all checks pass, the bot looks for a near-money call contract that passes liquidity and risk checks. Otherwise it prints `NO_TRADE`.
+
 Important `.env` controls:
 
 ```bash

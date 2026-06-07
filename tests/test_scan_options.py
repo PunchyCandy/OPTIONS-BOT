@@ -1,10 +1,16 @@
 import unittest
+import pandas as pd
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from alpaca_clients import BOT_ORDER_PREFIX, BotConfig
 from cancel_orders import should_cancel_order
-from scan_options import choose_best_contract, place_paper_option_order, validate_order_risk
+from scan_options import (
+    choose_best_contract,
+    get_vwap_reclaim_call_signal,
+    place_paper_option_order,
+    validate_order_risk,
+)
 
 
 class FakeTradingClient:
@@ -136,6 +142,60 @@ class ScanOptionsTests(unittest.TestCase):
         self.assertIsNotNone(order)
         self.assertIsNotNone(client.submitted_order)
         self.assertTrue(client.submitted_order.client_order_id.startswith(BOT_ORDER_PREFIX))
+
+    def test_vwap_reclaim_call_signal_fires_on_strict_reversal(self):
+        index = pd.date_range("2026-06-08 09:30", periods=30, freq="5min", tz="America/New_York")
+        close = [
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            99, 98, 97, 96, 95,
+            94, 93, 92, 89, 99,
+        ]
+        volume = [1000] * 29 + [3000]
+        df = pd.DataFrame(
+            {
+                "Open": close,
+                "High": [price + 0.25 for price in close],
+                "Low": [price - 0.25 for price in close],
+                "Close": close,
+                "Volume": volume,
+            },
+            index=index,
+        )
+
+        with patch("scan_options.yf.download", return_value=df):
+            signal = get_vwap_reclaim_call_signal("SPY")
+
+        self.assertEqual(signal, "BUY_CALL")
+
+    def test_vwap_reclaim_call_signal_requires_vwap_reclaim(self):
+        index = pd.date_range("2026-06-08 09:30", periods=30, freq="5min", tz="America/New_York")
+        close = [
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            100, 100, 100, 100, 100,
+            99, 98, 97, 96, 95,
+            94, 93, 92, 89, 98,
+        ]
+        volume = [1000] * 29 + [3000]
+        df = pd.DataFrame(
+            {
+                "Open": close,
+                "High": [price + 0.25 for price in close],
+                "Low": [price - 0.25 for price in close],
+                "Close": close,
+                "Volume": volume,
+            },
+            index=index,
+        )
+
+        with patch("scan_options.yf.download", return_value=df):
+            signal = get_vwap_reclaim_call_signal("SPY")
+
+        self.assertEqual(signal, "NO_TRADE")
 
 
 if __name__ == "__main__":

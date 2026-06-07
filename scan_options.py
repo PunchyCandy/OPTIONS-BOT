@@ -202,34 +202,97 @@ def choose_best_contract(rows, underlying_price, max_spread_pct=10, max_mid_pric
     )
 
 
-def get_trend_signal(symbol="SPY"):
-    df = yf.download(symbol, period="6mo", interval="1d", auto_adjust=True)
+def _series_from_download(df, column):
+    series = df[column]
+
+    if hasattr(series, "columns"):
+        series = series.iloc[:, 0]
+
+    return series
+
+
+def get_vwap_reclaim_call_signal(symbol="SPY"):
+    df = yf.download(symbol, period="5d", interval="5m", auto_adjust=True)
 
     if df.empty:
         raise ValueError(f"No price data returned for {symbol}")
 
-    close = df["Close"]
+    close = _series_from_download(df, "Close")
+    high = _series_from_download(df, "High")
+    low = _series_from_download(df, "Low")
+    volume = _series_from_download(df, "Volume")
 
-    if hasattr(close, "columns"):
-        close = close.iloc[:, 0]
+    if len(close) < 25:
+        raise ValueError(f"Not enough intraday price data returned for {symbol}")
 
-    sma_20 = close.rolling(window=20).mean()
-    sma_50 = close.rolling(window=50).mean()
+    session_day = close.index[-1].date()
+    session_mask = close.index.date == session_day
+    session_close = close[session_mask]
+    session_high = high[session_mask]
+    session_low = low[session_mask]
+    session_volume = volume[session_mask]
 
-    latest_close = close.iloc[-1].item()
-    latest_sma_20 = sma_20.iloc[-1].item()
-    latest_sma_50 = sma_50.iloc[-1].item()
+    typical_price = (session_high + session_low + session_close) / 3
+    vwap = (typical_price * session_volume).cumsum() / session_volume.cumsum()
 
-    print("\nTrend check:")
+    rolling_close = close.rolling(window=20)
+    middle_band = rolling_close.mean()
+    band_std = rolling_close.std()
+    lower_band = middle_band - (2 * band_std)
+
+    delta = close.diff()
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
+    avg_gain = gains.rolling(window=14).mean()
+    avg_loss = losses.rolling(window=14).mean()
+    relative_strength = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + relative_strength))
+
+    average_volume = volume.rolling(window=20).mean()
+
+    latest_close = float(close.iloc[-1])
+    previous_close = float(close.iloc[-2])
+    latest_lower_band = float(lower_band.iloc[-1])
+    previous_lower_band = float(lower_band.iloc[-2])
+    latest_rsi = float(rsi.iloc[-1])
+    previous_rsi = float(rsi.iloc[-2])
+    latest_vwap = float(vwap.iloc[-1])
+    latest_volume = float(volume.iloc[-1])
+    latest_average_volume = float(average_volume.iloc[-1])
+
+    touched_lower_band_recently = (
+        close.tail(6).le(lower_band.tail(6))
+        | low.tail(6).le(lower_band.tail(6))
+    ).any()
+    had_exhausted_rsi_recently = rsi.tail(6).lt(35).any()
+    closed_back_inside_band = previous_close <= previous_lower_band and latest_close > latest_lower_band
+    rsi_reclaimed_35 = previous_rsi <= 35 < latest_rsi
+    reclaimed_vwap = latest_close >= latest_vwap
+    reversal_volume = latest_volume > latest_average_volume
+
+    print("\nVWAP reclaim call strategy:")
     print("Latest close:", round(latest_close, 2))
-    print("20 SMA:", round(latest_sma_20, 2))
-    print("50 SMA:", round(latest_sma_50, 2))
+    print("Lower Bollinger Band:", round(latest_lower_band, 2))
+    print("VWAP:", round(latest_vwap, 2))
+    print("RSI 14:", round(latest_rsi, 2))
+    print("Volume:", int(latest_volume))
+    print("20-bar avg volume:", int(latest_average_volume))
+    print("Touched lower band recently:", touched_lower_band_recently)
+    print("RSI was below 35 recently:", had_exhausted_rsi_recently)
+    print("Closed back above lower band:", closed_back_inside_band)
+    print("RSI crossed above 35:", rsi_reclaimed_35)
+    print("Reclaimed VWAP:", reclaimed_vwap)
+    print("Volume above average:", reversal_volume)
 
-    if latest_close > latest_sma_20 > latest_sma_50:
+    if (
+        touched_lower_band_recently
+        and had_exhausted_rsi_recently
+        and closed_back_inside_band
+        and rsi_reclaimed_35
+        and reclaimed_vwap
+        and reversal_volume
+    ):
         return "BUY_CALL"
-
-    if latest_close < latest_sma_20 < latest_sma_50:
-        return "BUY_PUT"
 
     return "NO_TRADE"
 
@@ -265,7 +328,7 @@ def validate_order_risk(trading_client, selected_contract, signal, qty, config):
     if selected_contract is None:
         return False, "No selected contract."
 
-    if signal not in ["BUY_CALL", "BUY_PUT"]:
+    if signal != "BUY_CALL":
         return False, f"Signal is {signal}."
 
     symbol = selected_contract["symbol"]
@@ -400,6 +463,10 @@ def run_scan(
     underlying_price = get_stock_mid_price(stock_data_client, underlying)
     print(f"{underlying} estimated mid price: {underlying_price}")
 
+    signal = get_vwap_reclaim_call_signal(underlying)
+
+    print("\nBot signal:", signal)
+
     print("\nFetching call contracts...")
     calls = get_contracts(trading_client, underlying, ContractType.CALL)
     near_calls = filter_near_money_contracts(calls, underlying_price, width=20)
@@ -418,32 +485,8 @@ def run_scan(
     print("\nBest call candidate:")
     print(best_call)
 
-    print("\nFetching put contracts...")
-    puts = get_contracts(trading_client, underlying, ContractType.PUT)
-    near_puts = filter_near_money_contracts(puts, underlying_price, width=20)
-    put_rows = attach_option_quotes(option_data_client, near_puts)
-
-    print(f"\nFound {len(put_rows)} near-money put candidates")
-    print_candidates(put_rows)
-
-    best_put = choose_best_contract(
-        put_rows,
-        underlying_price,
-        max_spread_pct=config.max_spread_pct,
-        max_mid_price=config.max_mid_price,
-    )
-
-    print("\nBest put candidate:")
-    print(best_put)
-
-    signal = get_trend_signal(underlying)
-
-    print("\nBot signal:", signal)
-
     if signal == "BUY_CALL":
         selected_contract = best_call
-    elif signal == "BUY_PUT":
-        selected_contract = best_put
     else:
         selected_contract = None
 
