@@ -65,16 +65,19 @@ The bot defaults to Alpaca paper trading and defaults to dry-run scanning. Keep 
 
 ## Strategy
 
-The bot uses a strict calls-only intraday reversal setup for SPY/QQQ-style liquid options:
+The bot uses a calls-only oversold RSI setup for SPY/QQQ-style liquid options:
 
-1. Price touched or closed below the lower 20-period Bollinger Band recently.
-2. RSI 14 was below 35 recently.
-3. Price closes back above the lower Bollinger Band.
-4. RSI crosses back above 35.
-5. Price reclaims session VWAP.
-6. Current volume is above 20-bar average volume.
+1. Calculate RSI 14 from recent 5-minute candles.
+2. Return `BUY_CALL` when the latest RSI is below 25.
+3. Otherwise print `NO_TRADE`.
 
-If all checks pass, the bot looks for a near-money call contract that passes liquidity and risk checks. Otherwise it prints `NO_TRADE`.
+When the RSI check passes, the bot looks for a near-money call contract that passes liquidity and risk checks.
+
+In live paper-order mode, each scan also checks open option positions for exits:
+
+1. Submit a sell limit order when the option is up 100% or more from average entry.
+2. Submit a sell limit order when the option is down 50% or more from average entry.
+3. Skip new entries during a scan that submitted an exit order.
 
 Important `.env` controls:
 

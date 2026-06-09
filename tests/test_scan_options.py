@@ -8,15 +8,24 @@ from cancel_orders import should_cancel_order
 from scan_options import (
     choose_best_contract,
     get_vwap_reclaim_call_signal,
+    manage_open_positions,
     place_paper_option_order,
     validate_order_risk,
 )
 
 
 class FakeTradingClient:
-    def __init__(self, orders=None, position_qty=0, buying_power=100000, trading_blocked=False):
+    def __init__(
+        self,
+        orders=None,
+        position_qty=0,
+        positions=None,
+        buying_power=100000,
+        trading_blocked=False,
+    ):
         self.orders = orders or []
         self.position_qty = position_qty
+        self.positions = positions or []
         self.account = SimpleNamespace(
             buying_power=str(buying_power),
             trading_blocked=trading_blocked,
@@ -32,6 +41,9 @@ class FakeTradingClient:
 
         return SimpleNamespace(qty=str(self.position_qty))
 
+    def get_all_positions(self):
+        return self.positions
+
     def get_account(self):
         return self.account
 
@@ -46,6 +58,21 @@ class FakeTradingClient:
             symbol=order_request.symbol,
             limit_price=order_request.limit_price,
         )
+
+
+class FakeOptionDataClient:
+    def __init__(self, bid, ask):
+        self.bid = bid
+        self.ask = ask
+
+    def get_option_latest_quote(self, request):
+        symbol = request.symbol_or_symbols[0]
+        return {
+            symbol: SimpleNamespace(
+                bid_price=self.bid,
+                ask_price=self.ask,
+            )
+        }
 
 
 def make_config(**overrides):
@@ -143,17 +170,65 @@ class ScanOptionsTests(unittest.TestCase):
         self.assertIsNotNone(client.submitted_order)
         self.assertTrue(client.submitted_order.client_order_id.startswith(BOT_ORDER_PREFIX))
 
-    def test_vwap_reclaim_call_signal_fires_on_strict_reversal(self):
+    def test_manage_open_positions_sells_at_100_percent_profit(self):
+        position = SimpleNamespace(
+            symbol="SPY260619C00600000",
+            qty="1",
+            avg_entry_price="2.0",
+        )
+        client = FakeTradingClient(positions=[position])
+        option_data_client = FakeOptionDataClient(bid=4.0, ask=4.0)
+
+        with patch("scan_options.is_regular_market_hours", return_value=True):
+            exit_orders = manage_open_positions(client, option_data_client, make_config())
+
+        self.assertEqual(exit_orders, 1)
+        self.assertEqual(client.submitted_order.side.value, "sell")
+        self.assertEqual(client.submitted_order.limit_price, 4.0)
+        self.assertTrue(client.submitted_order.client_order_id.startswith(f"{BOT_ORDER_PREFIX}-exit-"))
+
+    def test_manage_open_positions_sells_at_50_percent_loss(self):
+        position = SimpleNamespace(
+            symbol="SPY260619C00600000",
+            qty="1",
+            avg_entry_price="2.0",
+        )
+        client = FakeTradingClient(positions=[position])
+        option_data_client = FakeOptionDataClient(bid=1.0, ask=1.0)
+
+        with patch("scan_options.is_regular_market_hours", return_value=True):
+            exit_orders = manage_open_positions(client, option_data_client, make_config())
+
+        self.assertEqual(exit_orders, 1)
+        self.assertEqual(client.submitted_order.side.value, "sell")
+        self.assertEqual(client.submitted_order.limit_price, 1.0)
+
+    def test_manage_open_positions_holds_before_exit_thresholds(self):
+        position = SimpleNamespace(
+            symbol="SPY260619C00600000",
+            qty="1",
+            avg_entry_price="2.0",
+        )
+        client = FakeTradingClient(positions=[position])
+        option_data_client = FakeOptionDataClient(bid=2.8, ask=2.8)
+
+        with patch("scan_options.is_regular_market_hours", return_value=True):
+            exit_orders = manage_open_positions(client, option_data_client, make_config())
+
+        self.assertEqual(exit_orders, 0)
+        self.assertIsNone(client.submitted_order)
+
+    def test_vwap_reclaim_call_signal_fires_when_rsi_is_below_25(self):
         index = pd.date_range("2026-06-08 09:30", periods=30, freq="5min", tz="America/New_York")
         close = [
             100, 100, 100, 100, 100,
             100, 100, 100, 100, 100,
             100, 100, 100, 100, 100,
-            100, 100, 100, 100, 100,
             99, 98, 97, 96, 95,
-            94, 93, 92, 89, 99,
+            94, 93, 92, 91, 90,
+            89, 88, 87, 86, 85,
         ]
-        volume = [1000] * 29 + [3000]
+        volume = [1000] * 30
         df = pd.DataFrame(
             {
                 "Open": close,
@@ -170,17 +245,17 @@ class ScanOptionsTests(unittest.TestCase):
 
         self.assertEqual(signal, "BUY_CALL")
 
-    def test_vwap_reclaim_call_signal_requires_vwap_reclaim(self):
+    def test_vwap_reclaim_call_signal_requires_rsi_below_25(self):
         index = pd.date_range("2026-06-08 09:30", periods=30, freq="5min", tz="America/New_York")
         close = [
             100, 100, 100, 100, 100,
             100, 100, 100, 100, 100,
             100, 100, 100, 100, 100,
-            100, 100, 100, 100, 100,
-            99, 98, 97, 96, 95,
-            94, 93, 92, 89, 98,
+            101, 102, 103, 104, 105,
+            106, 107, 108, 109, 110,
+            111, 112, 113, 114, 115,
         ]
-        volume = [1000] * 29 + [3000]
+        volume = [1000] * 30
         df = pd.DataFrame(
             {
                 "Open": close,

@@ -218,27 +218,9 @@ def get_vwap_reclaim_call_signal(symbol="SPY"):
         raise ValueError(f"No price data returned for {symbol}")
 
     close = _series_from_download(df, "Close")
-    high = _series_from_download(df, "High")
-    low = _series_from_download(df, "Low")
-    volume = _series_from_download(df, "Volume")
 
     if len(close) < 25:
         raise ValueError(f"Not enough intraday price data returned for {symbol}")
-
-    session_day = close.index[-1].date()
-    session_mask = close.index.date == session_day
-    session_close = close[session_mask]
-    session_high = high[session_mask]
-    session_low = low[session_mask]
-    session_volume = volume[session_mask]
-
-    typical_price = (session_high + session_low + session_close) / 3
-    vwap = (typical_price * session_volume).cumsum() / session_volume.cumsum()
-
-    rolling_close = close.rolling(window=20)
-    middle_band = rolling_close.mean()
-    band_std = rolling_close.std()
-    lower_band = middle_band - (2 * band_std)
 
     delta = close.diff()
     gains = delta.clip(lower=0)
@@ -248,50 +230,17 @@ def get_vwap_reclaim_call_signal(symbol="SPY"):
     relative_strength = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + relative_strength))
 
-    average_volume = volume.rolling(window=20).mean()
-
     latest_close = float(close.iloc[-1])
-    previous_close = float(close.iloc[-2])
-    latest_lower_band = float(lower_band.iloc[-1])
-    previous_lower_band = float(lower_band.iloc[-2])
     latest_rsi = float(rsi.iloc[-1])
-    previous_rsi = float(rsi.iloc[-2])
-    latest_vwap = float(vwap.iloc[-1])
-    latest_volume = float(volume.iloc[-1])
-    latest_average_volume = float(average_volume.iloc[-1])
 
-    touched_lower_band_recently = (
-        close.tail(6).le(lower_band.tail(6))
-        | low.tail(6).le(lower_band.tail(6))
-    ).any()
-    had_exhausted_rsi_recently = rsi.tail(6).lt(35).any()
-    closed_back_inside_band = previous_close <= previous_lower_band and latest_close > latest_lower_band
-    rsi_reclaimed_35 = previous_rsi <= 35 < latest_rsi
-    reclaimed_vwap = latest_close >= latest_vwap
-    reversal_volume = latest_volume > latest_average_volume
+    rsi_below_25 = latest_rsi < 25
 
-    print("\nVWAP reclaim call strategy:")
+    print("\nRSI oversold call strategy:")
     print("Latest close:", round(latest_close, 2))
-    print("Lower Bollinger Band:", round(latest_lower_band, 2))
-    print("VWAP:", round(latest_vwap, 2))
     print("RSI 14:", round(latest_rsi, 2))
-    print("Volume:", int(latest_volume))
-    print("20-bar avg volume:", int(latest_average_volume))
-    print("Touched lower band recently:", touched_lower_band_recently)
-    print("RSI was below 35 recently:", had_exhausted_rsi_recently)
-    print("Closed back above lower band:", closed_back_inside_band)
-    print("RSI crossed above 35:", rsi_reclaimed_35)
-    print("Reclaimed VWAP:", reclaimed_vwap)
-    print("Volume above average:", reversal_volume)
+    print("RSI below 25:", rsi_below_25)
 
-    if (
-        touched_lower_band_recently
-        and had_exhausted_rsi_recently
-        and closed_back_inside_band
-        and rsi_reclaimed_35
-        and reclaimed_vwap
-        and reversal_volume
-    ):
+    if rsi_below_25:
         return "BUY_CALL"
 
     return "NO_TRADE"
@@ -428,6 +377,111 @@ def place_paper_option_order(
     return order
 
 
+def get_option_mid_price(option_data_client, symbol):
+    request = OptionLatestQuoteRequest(symbol_or_symbols=[symbol])
+    quotes = option_data_client.get_option_latest_quote(request)
+    quote = quotes.get(symbol)
+
+    if quote is None:
+        raise ValueError(f"No option quote returned for {symbol}")
+
+    bid = float(quote.bid_price or 0)
+    ask = float(quote.ask_price or 0)
+
+    if bid <= 0 or ask <= 0:
+        raise ValueError(f"Bad option quote for {symbol}: bid={bid}, ask={ask}")
+
+    return round((bid + ask) / 2, 2)
+
+
+def get_exit_reason(avg_entry_price, current_mid):
+    if avg_entry_price <= 0:
+        return None
+
+    pnl_pct = (current_mid - avg_entry_price) / avg_entry_price
+
+    if pnl_pct >= 1:
+        return f"Take profit hit: {pnl_pct:.0%}."
+
+    if pnl_pct <= -0.5:
+        return f"Stop loss hit: {pnl_pct:.0%}."
+
+    return None
+
+
+def place_paper_option_sell_order(trading_client, symbol, qty, limit_price, reason):
+    order_request = LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        type="limit",
+        time_in_force=TimeInForce.DAY,
+        limit_price=limit_price,
+        client_order_id=f"{BOT_ORDER_PREFIX}-exit-{uuid4().hex[:15]}",
+    )
+
+    order = trading_client.submit_order(order_request)
+
+    print("\nPaper sell order submitted.")
+    print("Reason:", reason)
+    print("Order ID:", order.id)
+    print("Status:", order.status)
+    print("Symbol:", order.symbol)
+    print("Qty:", qty)
+    print("Limit price:", order.limit_price)
+
+    return order
+
+
+def manage_open_positions(trading_client, option_data_client, config):
+    if not is_regular_market_hours(trading_client):
+        print("Market is closed for regular options trading. No sell orders placed.")
+        return 0
+
+    positions = trading_client.get_all_positions()
+    exit_orders = 0
+
+    for position in positions:
+        symbol = position.symbol
+
+        if not symbol.startswith(config.underlying):
+            continue
+
+        qty = abs(int(float(position.qty)))
+
+        if qty <= 0:
+            continue
+
+        if has_open_order_for_symbol(trading_client, symbol):
+            print(f"Open order already exists for {symbol}. No sell order placed.")
+            continue
+
+        avg_entry_price = float(position.avg_entry_price)
+        current_mid = get_option_mid_price(option_data_client, symbol)
+        reason = get_exit_reason(avg_entry_price, current_mid)
+
+        print("\nPosition exit check:")
+        print("Symbol:", symbol)
+        print("Qty:", qty)
+        print("Avg entry:", round(avg_entry_price, 2))
+        print("Current mid:", current_mid)
+        print("Exit reason:", reason)
+
+        if reason is None:
+            continue
+
+        place_paper_option_sell_order(
+            trading_client=trading_client,
+            symbol=symbol,
+            qty=qty,
+            limit_price=current_mid,
+            reason=reason,
+        )
+        exit_orders += 1
+
+    return exit_orders
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Scan near-money option contracts.")
     parser.add_argument("--place-order", action="store_true", help="Submit a paper order after all checks pass.")
@@ -459,6 +513,17 @@ def run_scan(
     print("\n" + "=" * 72)
     print(datetime.now(ZoneInfo("America/New_York")).isoformat(timespec="seconds"))
     print(market_status_message(trading_client))
+
+    if place_order:
+        exit_orders = manage_open_positions(
+            trading_client=trading_client,
+            option_data_client=option_data_client,
+            config=config,
+        )
+
+        if exit_orders:
+            print("\nExit order submitted. Skipping new entries until next scan.")
+            return
 
     underlying_price = get_stock_mid_price(stock_data_client, underlying)
     print(f"{underlying} estimated mid price: {underlying_price}")
