@@ -1,5 +1,6 @@
 import unittest
 import pandas as pd
+from datetime import date
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -7,6 +8,7 @@ from alpaca_clients import BOT_ORDER_PREFIX, BotConfig
 from cancel_orders import should_cancel_order
 from scan_options import (
     choose_best_contract,
+    get_contracts,
     get_vwap_reclaim_call_signal,
     manage_open_positions,
     place_paper_option_order,
@@ -31,6 +33,7 @@ class FakeTradingClient:
             trading_blocked=trading_blocked,
         )
         self.submitted_order = None
+        self.option_contracts_request = None
 
     def get_orders(self, filter=None):
         return self.orders
@@ -59,6 +62,10 @@ class FakeTradingClient:
             limit_price=order_request.limit_price,
         )
 
+    def get_option_contracts(self, request):
+        self.option_contracts_request = request
+        return SimpleNamespace(option_contracts=[])
+
 
 class FakeOptionDataClient:
     def __init__(self, bid, ask):
@@ -78,8 +85,9 @@ class FakeOptionDataClient:
 def make_config(**overrides):
     defaults = {
         "underlying": "SPY",
-        "max_contract_cost": 2500,
-        "max_mid_price": 25,
+        "account_budget": 100,
+        "max_contract_cost": 100,
+        "max_mid_price": 1,
         "max_spread_pct": 10,
         "max_open_orders": 1,
         "max_position_qty": 1,
@@ -91,6 +99,15 @@ def make_config(**overrides):
 
 
 class ScanOptionsTests(unittest.TestCase):
+    def test_get_contracts_requests_same_day_expiration(self):
+        client = FakeTradingClient()
+
+        contracts = get_contracts(client, "SPY")
+
+        self.assertEqual(contracts, [])
+        self.assertEqual(client.option_contracts_request.expiration_date_gte, date.today())
+        self.assertEqual(client.option_contracts_request.expiration_date_lte, date.today())
+
     def test_choose_best_contract_filters_and_prefers_nearest_strike(self):
         rows = [
             {"symbol": "SPY1", "strike": 600, "mid": 2, "spread_pct": 5, "tradable": True},
@@ -135,7 +152,7 @@ class ScanOptionsTests(unittest.TestCase):
         client = FakeTradingClient()
         selected_contract = {
             "symbol": "SPY260619C00600000",
-            "mid": 2.5,
+            "mid": 0.5,
         }
 
         ok, reason = validate_order_risk(
@@ -149,11 +166,35 @@ class ScanOptionsTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(reason, "Risk checks passed.")
 
+    def test_validate_order_risk_rejects_when_account_budget_would_be_exceeded(self):
+        position = SimpleNamespace(
+            symbol="SPY260611C00600000",
+            qty="1",
+            avg_entry_price="0.5",
+            cost_basis="60",
+        )
+        client = FakeTradingClient(positions=[position])
+        selected_contract = {
+            "symbol": "SPY260611C00601000",
+            "mid": 0.5,
+        }
+
+        ok, reason = validate_order_risk(
+            client,
+            selected_contract,
+            "BUY_CALL",
+            qty=1,
+            config=make_config(account_budget=100),
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("exceeds account budget", reason)
+
     def test_place_paper_option_order_can_skip_prompt_for_vm_mode(self):
         client = FakeTradingClient()
         selected_contract = {
             "symbol": "SPY260619C00600000",
-            "mid": 2.5,
+            "mid": 0.5,
         }
 
         with patch("scan_options.is_regular_market_hours", return_value=True):

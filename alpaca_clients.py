@@ -15,6 +15,7 @@ BOT_ORDER_PREFIX = "options-bot"
 @dataclass(frozen=True)
 class BotConfig:
     underlying: str
+    account_budget: float
     max_contract_cost: float
     max_mid_price: float
     max_spread_pct: float
@@ -68,8 +69,9 @@ def get_option_data_client():
 def get_bot_config():
     return BotConfig(
         underlying=os.getenv("BOT_UNDERLYING", "SPY"),
-        max_contract_cost=_env_float("BOT_MAX_CONTRACT_COST", 2500),
-        max_mid_price=_env_float("BOT_MAX_MID_PRICE", 25),
+        account_budget=_env_float("BOT_ACCOUNT_BUDGET", 100),
+        max_contract_cost=_env_float("BOT_MAX_CONTRACT_COST", 100),
+        max_mid_price=_env_float("BOT_MAX_MID_PRICE", 1),
         max_spread_pct=_env_float("BOT_MAX_SPREAD_PCT", 10),
         max_open_orders=_env_int("BOT_MAX_OPEN_ORDERS", 1),
         max_position_qty=_env_int("BOT_MAX_POSITION_QTY", 1),

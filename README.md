@@ -71,7 +71,7 @@ The bot uses a calls-only oversold RSI setup for SPY/QQQ-style liquid options:
 2. Return `BUY_CALL` when the latest RSI is below 25.
 3. Otherwise print `NO_TRADE`.
 
-When the RSI check passes, the bot looks for a near-money call contract that passes liquidity and risk checks.
+When the RSI check passes, the bot looks for a same-day-expiration call contract that passes liquidity and risk checks. By default, it only considers cheap contracts with a midpoint at or below $1.00 and keeps total SPY option exposure within a $100 account budget.
 
 In live paper-order mode, each scan also checks open option positions for exits:
 
@@ -83,8 +83,9 @@ Important `.env` controls:
 
 ```bash
 BOT_UNDERLYING=SPY
-BOT_MAX_CONTRACT_COST=2500
-BOT_MAX_MID_PRICE=25
+BOT_ACCOUNT_BUDGET=100
+BOT_MAX_CONTRACT_COST=100
+BOT_MAX_MID_PRICE=1
 BOT_MAX_SPREAD_PCT=10
 BOT_MAX_OPEN_ORDERS=1
 BOT_MAX_POSITION_QTY=1

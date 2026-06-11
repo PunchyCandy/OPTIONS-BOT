@@ -1,6 +1,6 @@
 import argparse
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -45,6 +45,27 @@ def get_position_qty(trading_client, symbol):
     return abs(int(float(position.qty)))
 
 
+def get_underlying_position_exposure(trading_client, underlying):
+    exposure = 0
+
+    for position in trading_client.get_all_positions():
+        symbol = position.symbol
+
+        if not symbol.startswith(underlying):
+            continue
+
+        cost_basis = getattr(position, "cost_basis", None)
+        market_value = getattr(position, "market_value", None)
+        value = cost_basis if cost_basis is not None else market_value
+
+        if value is None:
+            continue
+
+        exposure += abs(float(value))
+
+    return round(exposure, 2)
+
+
 def get_stock_mid_price(stock_data_client, symbol="SPY"):
     request = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quotes = stock_data_client.get_stock_latest_quote(request)
@@ -61,15 +82,13 @@ def get_stock_mid_price(stock_data_client, symbol="SPY"):
 
 def get_contracts(trading_client, symbol="SPY", contract_type=ContractType.CALL):
     today = date.today()
-    min_exp = today + timedelta(days=30)
-    max_exp = today + timedelta(days=45)
 
     request = GetOptionContractsRequest(
         underlying_symbols=[symbol],
         status=AssetStatus.ACTIVE,
         type=contract_type,
-        expiration_date_gte=min_exp,
-        expiration_date_lte=max_exp,
+        expiration_date_gte=today,
+        expiration_date_lte=today,
         limit=1000,
     )
 
@@ -304,6 +323,14 @@ def validate_order_risk(trading_client, selected_contract, signal, qty, config):
 
     if estimated_cost > config.max_contract_cost:
         return False, f"Estimated cost {estimated_cost} exceeds max {config.max_contract_cost}."
+
+    current_exposure = get_underlying_position_exposure(trading_client, config.underlying)
+
+    if current_exposure + estimated_cost > config.account_budget:
+        return (
+            False,
+            f"Estimated exposure {current_exposure + estimated_cost} exceeds account budget {config.account_budget}.",
+        )
 
     account = trading_client.get_account()
 
